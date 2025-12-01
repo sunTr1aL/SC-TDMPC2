@@ -155,7 +155,7 @@ def populate_env_dims(cfg):
     if pretrained_aligned and all(val is not None and val != "???" for val in ready_fields):
         return cfg, None
 
-    task = normalize_task_name(getattr(cfg, "task", None))
+    task = getattr(cfg, "task", None)
     tasks = getattr(cfg, "tasks", None)
 
     single_task = None
@@ -180,7 +180,7 @@ def populate_env_dims(cfg):
         raise ValueError("populate_env_dims: neither cfg.task nor cfg.tasks provide a string task")
 
     cfg_env = copy.deepcopy(cfg)
-    cfg_env.task = normalize_task_name(single_task)
+    cfg_env.task = single_task
 
     if hasattr(cfg_env, "tasks"):
         cfg_env.tasks = None
@@ -289,16 +289,3 @@ def populate_env_dims(cfg):
         cfg.episode_length = cfg_env.episode_length
 
     return cfg, env
-def normalize_task_name(task: str | None) -> str | None:
-    """Normalize user-provided task names.
-
-    The codebase expects DMControl-style task names that use underscores
-    (e.g., ``humanoid_run``). Users sometimes pass hyphenated variants from
-    the command line (e.g., ``humanoid-run``). Converting hyphens to
-    underscores here keeps downstream environment creation robust while
-    preserving non-string values.
-    """
-
-    if isinstance(task, str):
-        return task.replace("-", "_")
-    return task
