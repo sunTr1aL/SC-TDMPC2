@@ -35,6 +35,14 @@ except:
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 
+def normalize_task_name(task):
+    """Convert common user input variants into the canonical format."""
+
+    if isinstance(task, str):
+        return task.replace('-', '_')
+    return task
+
+
 def make_multitask_env(cfg):
     """
     Make a multi-task environment for TD-MPC2 experiments.
@@ -70,11 +78,22 @@ def make_env(cfg):
 
     else:
         env = None
-        for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
-            try:
-                env = fn(cfg)
-            except ValueError:
-                pass
+        tasks_to_try = [cfg.task]
+        normalized_task = normalize_task_name(cfg.task)
+        if normalized_task != cfg.task:
+            tasks_to_try.append(normalized_task)
+
+        for task_name in tasks_to_try:
+            cfg_attempt = deepcopy(cfg)
+            cfg_attempt.task = task_name
+
+            for fn in [make_dm_control_env, make_maniskill_env, make_metaworld_env, make_myosuite_env, make_mujoco_env]:
+                try:
+                    env = fn(cfg_attempt)
+                except ValueError:
+                    pass
+            if env is not None:
+                break
         if env is None:
             raise ValueError(f'Failed to make environment "{cfg.task}": please verify that dependencies are installed and that the task exists.')
         env = TensorWrapper(env)
