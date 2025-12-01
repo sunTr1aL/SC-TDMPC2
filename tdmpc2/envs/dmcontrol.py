@@ -94,9 +94,9 @@ def make_env(cfg):
 	Adapted from https://github.com/facebookresearch/drqv2
 	"""
 	domain, task = cfg.task.replace('-', '_').split('_', 1)
-	domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
-        if (domain, task) not in suite.ALL_TASKS:
-                raise ValueError('Unknown task:', task)
+		domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
+		suite.load(domain, task)
+		if (domain, task) not in suite.ALL_TASKS:                raise ValueError('Unknown task:', task)
         if getattr(cfg, 'obs', None) not in {'state', 'rgb'}:
                 print(f"[WARN] Invalid cfg.obs={getattr(cfg, 'obs', None)!r}, defaulting to 'state'")
                 cfg.obs = 'state'
