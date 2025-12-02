@@ -75,100 +75,70 @@ python tdmpc2/train.py \
 ## Collecting corrector training data from pretrained teachers
 Use the downloaded pretrained TD-MPC2 checkpoints as frozen teachers. The script can target a single model size or iterate over all downloaded sizes (excluding ~1M by default):
 
-**Single size example (5M teacher)**
-```bash
-cd tdmpc2
-python scripts/collect_corrector_data.py \
-  --task humanoid-run \
-  --model_size 5m \
-  --model_dir tdmpc2_pretrained \
-  --episodes 20 \
-  --plan_horizon 3 \
-  --history_len 4 \
-  --output data/corrector_data_5m.pt \
-  --device cuda
-```
-
-**All available pretrained sizes (auto-detected in `model_dir`)**
+**Collect data for walker-run (all model sizes)**
 ```bash
 python scripts/collect_corrector_data.py \
-  --task humanoid-run \
+  --task walker-run \
   --all_model_sizes \
   --model_dir tdmpc2_pretrained \
-  --episodes 20 \
+  --episodes 50 \
   --plan_horizon 3 \
   --history_len 4 \
-  --output data/corrector_data.pt
+  --output_dir data/walker_run
 ```
 
-- The default output name is automatically expanded to `data/corrector_data_<size>.pt` when `--all_model_sizes` is used.
-- Each dataset stores `z_real`, `z_pred`, `a_plan`, `a_teacher`, `distance`, and `history_feats` so both the two-tower and temporal correctors can train from the same file.
+- The default output name is automatically expanded to `data/walker_run/corrector_data_<model_id>.pt`.
+- Each dataset stores `z_real`, `z_pred`, `a_plan`, `a_teacher`, `distance`, and `history_feats`.
 
 -----
 
-## Training the corrector (per pretrained size)
-Train both corrector architectures on the collected buffers. The trainer automatically picks the right dataset naming pattern and saves per-size checkpoints.
+## Training the corrector
+Train both corrector architectures on the collected buffers.
+We use a larger architecture (`hidden_dim=512`, `num_layers=4`) and run on a single GPU to avoid NCCL issues.
 
-**Train both correctors for a single pretrained size**
+**Train correctors for walker-run**
 ```bash
-cd tdmpc2
-python tdmpc2/train_corrector.py \
-  --model_size 5m \
-  --data_dir data \
+CUDA_VISIBLE_DEVICES=0 python -m tdmpc2.train_corrector \
+  --data_dir data/walker_run \
+  --corrector_dir correctors/walker_run \
   --corrector_type both \
   --epochs 20 \
   --batch_size 256 \
   --history_len 4 \
-  --device cuda
+  --hidden_dim 512 \
+  --num_layers 4 \
+  --save_path correctors/walker_run
 ```
-This produces `correctors/corrector_5m_two_tower.pth` and `correctors/corrector_5m_temporal.pth`.
 
-**Train across every available dataset (matching all downloaded pretrained sizes)**
-```bash
-python tdmpc2/train_corrector.py \
-  --model_size all \
-  --data_dir data \
-  --corrector_type both \
-  --epochs 20 \
-  --batch_size 256 \
-  --history_len 4
-```
-- Use `--corrector_type two_tower` or `--corrector_type temporal` to limit training to a single architecture.
-- Pass `--data <path>` to target a custom dataset file instead of per-size discovery.
+This produces `correctors/walker_run/corrector_<model_id>_two_tower.pth` and `temporal.pth`.
 
 -----
 
-## Evaluating speculative execution (baseline vs. correctors)
-`scripts/eval_corrector.py` now evaluates baseline TD-MPC2 replanning, open-loop execution (2- and 3-step), and both correctors for each pretrained size. Results are aggregated into a CSV for plotting.
+## Evaluating speculative execution
+Evaluate the models with the trained correctors using `scripts/eval_mt30_humanoid.py`.
 
-**Evaluate a single pretrained size (reads checkpoints from `model_dir` and correctors from `corrector_dir`)**
+**Evaluate walker-run (all models)**
 ```bash
-cd tdmpc2
-python scripts/eval_corrector.py \
-  --task humanoid-run \
-  --model_size 5m \
-  --model_dir tdmpc2_pretrained \
-  --corrector_dir correctors \
-  --episodes 10 \
-  --spec_plan_horizon 3 \
-  --device cuda \
-  --results_csv results/corrector_eval/summary.csv
+python scripts/eval_mt30_humanoid.py \
+  --task walker-run \
+  --corrector_dir correctors/walker_run \
+  --episodes 5 \
+  --max_steps 1000 \
+  --corrector_hidden_dim 512 \
+  --corrector_layers 4
 ```
 
-**Evaluate all downloaded pretrained sizes**
+**Evaluate a single model size (e.g. 19M)**
 ```bash
-python scripts/eval_corrector.py \
-  --task humanoid-run \
-  --all_model_sizes \
-  --model_dir tdmpc2_pretrained \
-  --corrector_dir correctors \
-  --episodes 10 \
-  --spec_plan_horizon 3 \
-  --results_csv results/corrector_eval/summary.csv
+python scripts/eval_mt30_humanoid.py \
+  --task walker-run \
+  --corrector_dir correctors/walker_run \
+  --model_size 19M \
+  --episodes 5 \
+  --max_steps 1000 \
+  --corrector_hidden_dim 512 \
+  --corrector_layers 4
 ```
-
-- Per-run JSON/CSV metrics are written under `results/corrector_eval/`, and an aggregated summary CSV is saved to `--results_csv`.
-- Use `scripts/plot_corrector_eval.py --results_csv results/corrector_eval/summary.csv --output_dir results/corrector_eval/plots` to generate horizon/model-size/improvement plots.
 
 -----
 

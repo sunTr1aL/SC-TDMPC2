@@ -11,6 +11,7 @@ features allow the temporal transformer corrector to reason over recent mismatch
 """
 
 import argparse
+import copy
 import os
 import sys
 import time
@@ -135,7 +136,12 @@ def collect_for_agent(
     cfg.obs_type = str(getattr(cfg, "obs_type", cfg.obs)).lower()
     if cfg.obs_type not in {"state", "rgb"}:
         cfg.obs_type = cfg.obs
-    env = make_env(cfg)
+    
+    # Create env config that forces the requested task
+    env_cfg = copy.deepcopy(cfg)
+    env_cfg.task = args.task
+    env_cfg.multitask = False
+    env = make_env(env_cfg)
 
     task = None
     if cfg.multitask:
@@ -144,6 +150,16 @@ def collect_for_agent(
         task = getattr(env, "task", None)
         if task is None:
             task = getattr(cfg, "task", None)
+        
+        # If agent is multitask but we are running single task, resolve index
+        if agent.cfg.multitask and isinstance(task, str):
+            from tdmpc2.common import TASK_SET
+            # Try to find task in mt30 or mt80
+            for set_name in ['mt30', 'mt80']:
+                if task in TASK_SET[set_name]:
+                    task = TASK_SET[set_name].index(task)
+                    print(f"Resolved task '{args.task}' to index {task} for multitask agent")
+                    break
 
     print(f"Collecting corrector data for task {cfg.task} on device {cfg.device} -> {output_path}")
     episodes = 0
@@ -261,7 +277,7 @@ def _load_agent_for_model(
         checkpoint_path=ckpt_path,
         device=str(device),
         model_id=normalized_model_id,
-        task=args.task,
+        # task=args.task,  <-- REMOVED to preserve checkpoint task (e.g. mt30)
         obs_type=args.obs_type,
     )
     return agent, cfg

@@ -144,8 +144,8 @@ def train_worker(args: argparse.Namespace) -> None:
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=torch.cuda.is_available(),
+        num_workers=0,
+        pin_memory=False,
     )
 
     corrector = build_corrector_from_cfg(cfg, latent_dim=latent_dim, act_dim=act_dim, device=device)

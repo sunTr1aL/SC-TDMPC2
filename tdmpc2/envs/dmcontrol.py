@@ -24,8 +24,9 @@ def get_obs_shape(env):
 
 
 class DMControlWrapper:
-	def __init__(self, env, domain):
+	def __init__(self, env, domain, action_repeat=2):
 		self.env = env
+		self.action_repeat = action_repeat
 		self.camera_id = 2 if domain == 'quadruped' else 0
 		obs_shape = get_obs_shape(env)
 		action_shape = env.action_spec().shape
@@ -53,7 +54,7 @@ class DMControlWrapper:
 	def step(self, action):
 		reward = 0
 		action = action.astype(self.action_spec_dtype)
-		for _ in range(2):
+		for _ in range(self.action_repeat):
 			step = self.env.step(action)
 			reward += step.reward
 		return self._obs_to_array(step.observation), reward, False, defaultdict(float)
@@ -94,19 +95,19 @@ def make_env(cfg):
 	Adapted from https://github.com/facebookresearch/drqv2
 	"""
 	domain, task = cfg.task.replace('-', '_').split('_', 1)
-		domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
-		suite.load(domain, task)
-		if (domain, task) not in suite.ALL_TASKS:                raise ValueError('Unknown task:', task)
-        if getattr(cfg, 'obs', None) not in {'state', 'rgb'}:
-                print(f"[WARN] Invalid cfg.obs={getattr(cfg, 'obs', None)!r}, defaulting to 'state'")
-                cfg.obs = 'state'
-        assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
-        env = suite.load(domain,
-                                         task,
-                                         task_kwargs={'random': cfg.seed},
+	domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
+	if (domain, task) not in suite.ALL_TASKS:
+		raise ValueError('Unknown task:', task)
+	if getattr(cfg, 'obs', None) not in {'state', 'rgb'}:
+		print(f"[WARN] Invalid cfg.obs={getattr(cfg, 'obs', None)!r}, defaulting to 'state'")
+		cfg.obs = 'state'
+	assert cfg.obs in {'state', 'rgb'}, 'This task only supports state and rgb observations.'
+	env = suite.load(domain,
+					 task,
+					 task_kwargs={'random': cfg.seed},
 					 visualize_reward=False)
 	env = action_scale.Wrapper(env, minimum=-1., maximum=1.)
-	env = DMControlWrapper(env, domain)
+	env = DMControlWrapper(env, domain, getattr(cfg, 'action_repeat', 2))
 	if cfg.obs == 'rgb':
 		env = Pixels(env, cfg)
 	env = Timeout(env, max_episode_steps=500)

@@ -93,7 +93,7 @@ def parse_cfg(cfg: OmegaConf) -> OmegaConf:
         )
         for k, v in MODEL_SIZE[cfg.model_size].items():
             cfg[k] = v
-        if cfg.task == "mt30" and cfg.model_size == 19:
+        if (cfg.task == "mt30" or "mt30" in str(cfg.get("model_id", ""))) and cfg.model_size == 19:
             cfg.latent_dim = 512  # This checkpoint is slightly smaller
 
     # Multi-task

@@ -63,7 +63,7 @@ def _infer_dims_from_state(model_state: Dict[str, torch.Tensor]) -> Dict[str, in
         dims["pi_in_dim"] = int(model_state["_pi.0.weight"].shape[1])
 
     if dims:
-        print("[DEBUG] Inferred checkpoint dims:", dims)
+        print(f"[DEBUG] Inferred checkpoint dims: {dims}")
     return dims
 
 
@@ -103,6 +103,11 @@ def align_cfg_with_checkpoint(cfg, model_state: Dict[str, torch.Tensor]):
     pi_in_dim = inferred_dims.get("pi_in_dim", None)
     if pi_in_dim is not None:
         cfg.pi_in_dim = int(pi_in_dim)
+        # Infer latent_dim from pi_in_dim (latent_dim + task_dim)
+        task_dim = int(getattr(cfg, "task_dim", 0))
+        inferred_latent = int(pi_in_dim) - task_dim
+        if inferred_latent > 0:
+            cfg.latent_dim = inferred_latent
 
     cfg.pretrained_aligned = True
     return cfg
