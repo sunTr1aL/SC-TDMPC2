@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from omegaconf import OmegaConf
 
-from .tdmpc2 import TDMPC2
+from tdmpc2 import TDMPC2
 from .common.parser import parse_cfg, populate_env_dims
 from .envs import make_env
 
@@ -128,9 +128,15 @@ def list_pretrained_checkpoints(
     ``model_size_filter`` performs a case-insensitive exact match on the
     ``model_size`` field when provided.
     """
-
     checkpoints: Dict[str, Dict[str, str]] = {}
-    root = Path(checkpoint_dir)
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+    abs_checkpoint_dir = project_root / checkpoint_dir
+    root = abs_checkpoint_dir
+
+    if not root.is_dir():
+        return {}
+
     for path in root.glob("*"):
         if not path.is_file() or path.suffix.lower() not in extensions:
             continue
@@ -150,71 +156,90 @@ def list_pretrained_checkpoints(
     return dict(sorted(checkpoints.items()))
 
 
+def _apply_task_overrides(cfg, task: Optional[str], collection_mode: str) -> None:
+    if task is not None:
+        cfg.task = task
+        if hasattr(cfg, "env_cfg"):
+            cfg.env_cfg.task = task
+        if hasattr(cfg, "mt_tasks"):
+            cfg.mt_tasks = [task]
+        if hasattr(cfg, "tasks"):
+            cfg.tasks = [task]
+        if hasattr(cfg, "tasks_override"):
+            cfg.tasks_override = [task]
+
+    cfg.collection_mode = collection_mode
+    if hasattr(cfg, "env_cfg"):
+        cfg.env_cfg.collection_mode = collection_mode
+
+
 def load_pretrained_tdmpc2(
-    checkpoint_path: str,
-    device: str = "cuda",
-    model_id: Optional[str] = None,
+    ckpt_path: str,
     task: Optional[str] = None,
-    obs_type: Optional[str] = None,
+    model_size: Optional[int] = None,
+    device: str = "cuda",
+    obs: str = "state",
+    collection_mode: str = "single",
     cfg_overrides: Optional[dict] = None,
+    init_env: bool = True,
     **_: Dict,
 ):
     """Instantiate a TD-MPC2 agent from a checkpoint using an embedded or YAML config."""
 
-    state = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if not isinstance(state, dict):
-        raise RuntimeError(f"Checkpoint {checkpoint_path} must be a mapping with a saved config.")
-
-    if model_id is not None:
-        model_id = _canonical_model_id(model_id)
+        raise RuntimeError(f"Checkpoint {ckpt_path} must be a mapping with a saved config.")
 
     model_state = _extract_state_dict_from_checkpoint(state)
+    model_id = _canonical_model_id(Path(ckpt_path).stem)
 
-    env_for_dims = None
+    def _prepare_and_build(cfg):
+        if isinstance(cfg, OmegaConf.DictConfig):
+            cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        cfg.device = str(device)
+        cfg.disable_wandb = True
+        cfg.eval_mode = True
+        cfg.checkpoint = str(ckpt_path)
+        cfg.model_id = model_id
+
+        if model_size is not None:
+            cfg.model_size = int(model_size)
+        elif getattr(cfg, "model_size", None) is not None:
+            cfg.model_size = int(cfg.model_size)
+
+        _apply_task_overrides(cfg, task, collection_mode)
+
+        cfg.obs = obs.lower()
+        cfg.obs_type = cfg.obs
+
+        if cfg_overrides:
+            for key, value in cfg_overrides.items():
+                setattr(cfg, key, value)
+
+        cfg.compile = False
+
+        cfg = parse_cfg(cfg)
+        cfg = align_cfg_with_checkpoint(cfg, model_state)
+        env_for_dims = None
+        if init_env:
+            cfg, env_for_dims = populate_env_dims(cfg)
+
+            if cfg.multitask and getattr(cfg, "collection_mode", collection_mode) != "single":
+                make_env(cfg)
+
+        agent = TDMPC2(cfg)
+        agent.to(device)
+        agent.eval()
+
+        agent.load(model_state)
+        return agent, cfg
+
     for key in ("cfg", "config", "hydra_cfg"):
         if key in state:
             cfg = state[key]
-            if isinstance(cfg, OmegaConf.DictConfig):
-                cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-            cfg.device = str(device)
-            cfg.disable_wandb = True
-            cfg.eval_mode = True
-            cfg.checkpoint = str(checkpoint_path)
-            if model_id is not None:
-                cfg.model_id = model_id
-
-            if task is not None:
-                cfg.task = task
-
-            if obs_type is not None:
-                cfg.obs = obs_type.lower()
-                cfg.obs_type = cfg.obs
-
-            if cfg_overrides:
-                for key, value in cfg_overrides.items():
-                    setattr(cfg, key, value)
-
-            cfg.compile = False
-
-            cfg = parse_cfg(cfg)
-            cfg = align_cfg_with_checkpoint(cfg, model_state)
-            cfg, env_for_dims = populate_env_dims(cfg)
-
-            if cfg.multitask:
-                make_env(cfg)
-
-            agent = TDMPC2(cfg)
-            agent.to(device)
-            agent.eval()
-
-            agent.load(model_state)
-            return agent, cfg
+            return _prepare_and_build(cfg)
 
     # Fallback: no config stored in the checkpoint; load from YAML based on model id.
-    if model_id is None:
-        model_id = Path(checkpoint_path).stem
-    model_id = _canonical_model_id(model_id)
-
     checkpoint_dir = Path(__file__).resolve().parent
     base_config = checkpoint_dir / "config.yaml"
 
@@ -241,34 +266,26 @@ def load_pretrained_tdmpc2(
 
     # Infer task and size from the model id.
     stem = Path(model_id).stem
-    metadata = state.get("metadata", {}) if isinstance(state, dict) else {}
-    cfg.task = metadata.get("task", cfg.get("task", None))
+    if task is not None:
+        cfg.task = task
     parts = stem.split("-")
-    if cfg.task is None and parts:
-        # Treat all but a trailing size token as the task name when no metadata is available.
-        potential_size = parts[-1].rstrip("mM")
-        if len(parts) > 1 and potential_size.isdigit():
-            cfg.task = "-".join(parts[:-1])
-        else:
-            cfg.task = parts[0]
-
     if len(parts) > 1:
         size_token = parts[-1].rstrip("mM")
         if size_token.isdigit():
             cfg.model_size = int(size_token)
+    if getattr(cfg, "model_size", None) is None and model_size is not None:
+        cfg.model_size = int(model_size)
 
-    cfg.checkpoint = str(checkpoint_path)
+    cfg.checkpoint = str(ckpt_path)
     cfg.device = str(device)
     cfg.disable_wandb = True
     cfg.eval_mode = True
     cfg.model_id = model_id
 
-    if task is not None:
-        cfg.task = task
+    _apply_task_overrides(cfg, task, collection_mode)
 
-    if obs_type is not None:
-        cfg.obs = obs_type.lower()
-        cfg.obs_type = cfg.obs
+    cfg.obs = obs.lower()
+    cfg.obs_type = cfg.obs
 
     if cfg_overrides:
         for key, value in cfg_overrides.items():
@@ -278,10 +295,12 @@ def load_pretrained_tdmpc2(
 
     cfg = parse_cfg(cfg)
     cfg = align_cfg_with_checkpoint(cfg, model_state)
-    cfg, env_for_dims = populate_env_dims(cfg)
+    env_for_dims = None
+    if init_env:
+        cfg, env_for_dims = populate_env_dims(cfg)
 
-    if cfg.multitask:
-        make_env(cfg)
+        if cfg.multitask and getattr(cfg, "collection_mode", collection_mode) != "single":
+            make_env(cfg)
 
     agent = TDMPC2(cfg)
     agent.to(device)

@@ -16,8 +16,9 @@ import os
 import sys
 import time
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from omegaconf import OmegaConf
@@ -106,6 +107,16 @@ def build_cfg(args: argparse.Namespace) -> Any:
         cfg.episode_length = args.max_steps
     cfg = parse_cfg(cfg)
     return cfg
+
+
+def parse_multitask_model_id(model_id: str) -> Tuple[str, int]:
+    """Parse a multitask checkpoint identifier into dataset and size tokens."""
+
+    name, size_str = model_id.split("-", 1)
+    if name not in {"mt30", "mt70", "mt80"}:
+        raise AssertionError(f"Unexpected multitask name: {name}")
+    model_size = int(size_str.replace("M", ""))
+    return name, model_size
 
 
 def pad_history(history: deque, target_len: int, feat_dim: int) -> torch.Tensor:
@@ -242,6 +253,105 @@ def collect_for_agent(
     print(f"Saved {len(buffer)} samples to {output_path}{meta_str} ({steps_per_sec:.1f} env steps/sec)")
 
 
+def collect_for_agent_multitask(
+    agent: TDMPC2,
+    cfg: Any,
+    model_id: str,
+    out_path: Path,
+    episodes: int,
+    plan_horizon: int,
+    history_len: int,
+    device: torch.device,
+) -> None:
+    """Collect corrector data directly from a multi-task TD-MPC2 agent."""
+
+    cfg_env = deepcopy(cfg)
+    env = make_env(cfg_env)
+
+    buffer = CorrectorDataset()
+    history = deque(maxlen=history_len)
+    feat_dim = 3 * cfg.latent_dim + cfg.action_dim
+    task_id_list: List[Any] = []
+
+    for ep in range(episodes):
+        reset_out = env.reset()
+        obs, info = (reset_out if isinstance(reset_out, tuple) else (reset_out, {}))
+        done = False
+        ep_steps = 0
+        history.clear()
+
+        ep_task_id = None
+        if isinstance(info, dict):
+            ep_task_id = info.get("task_name") or info.get("task")
+        if ep_task_id is None:
+            ep_task_id = getattr(env, "task_name", None) or getattr(env, "task", None)
+
+        task_idx = getattr(env, "task_idx", None)
+
+        while not done:
+            obs_tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
+            actions_seq, latents_seq = agent.plan_with_predicted_latents(
+                obs_tensor, task=task_idx, horizon=plan_horizon, eval_mode=True
+            )
+            action = actions_seq[0].detach().cpu().numpy()
+            step_out = env.step(action)
+            if isinstance(step_out, tuple) and len(step_out) == 5:
+                next_obs, reward, done, truncated, step_info = step_out
+                done = bool(done or truncated)
+            else:
+                next_obs, reward, done, step_info = step_out
+            next_obs_tensor = torch.as_tensor(next_obs, device=device, dtype=torch.float32)
+
+            z_pred_next = latents_seq[1]
+            z_real_next = agent.model.encode(next_obs_tensor.unsqueeze(0), task_idx)
+            a_plan_next = actions_seq[1] if actions_seq.shape[0] > 1 else actions_seq[0]
+            distance = torch.norm(z_real_next.squeeze(0) - z_pred_next).item()
+
+            feat = torch.cat(
+                [
+                    z_real_next.squeeze(0).detach().cpu(),
+                    z_pred_next.detach().cpu(),
+                    (z_real_next.squeeze(0) - z_pred_next).detach().cpu(),
+                    a_plan_next.detach().cpu(),
+                ],
+                dim=-1,
+            )
+            history.append(feat)
+
+            a_teacher = agent.plan_from_observation(next_obs_tensor, task=task_idx, eval_mode=True)
+            history_feats = pad_history(history, history_len, feat_dim)
+            buffer.add(
+                z_real_next.squeeze(0),
+                z_pred_next,
+                a_plan_next,
+                a_teacher.squeeze(0),
+                distance,
+                history_feats,
+            )
+
+            obs = next_obs
+            ep_steps += 1
+
+        if ep_task_id is not None:
+            task_id_list.append(ep_task_id)
+
+    data = buffer.to_tensor_dict(device="cpu")
+    data.update(
+        {
+            "model_id": model_id,
+            "task_set": getattr(cfg, "task", None),
+            "model_size": getattr(cfg, "model_size", None),
+        }
+    )
+    if task_id_list:
+        data["episode_task_ids"] = task_id_list
+
+    torch.save(data, out_path)
+    print(
+        f"[collect_corrector_data] Saved {len(buffer)} samples for {model_id} to {out_path}"
+    )
+
+
 def _resolve_models(args: argparse.Namespace) -> Iterable[tuple[str, Dict[str, str]]]:
     ckpts = list_pretrained_checkpoints(
         args.checkpoint_dir, model_size_filter=None if args.all_model_sizes else args.model_size
@@ -270,16 +380,50 @@ def _resolve_models(args: argparse.Namespace) -> Iterable[tuple[str, Dict[str, s
 
 
 def _load_agent_for_model(
-    model_id: str, ckpt_path: str, args: argparse.Namespace, device: torch.device
+    model_id: str,
+    ckpt_path: str,
+    args: argparse.Namespace,
+    device: torch.device,
+    model_size_token: Optional[str] = None,
 ):
     normalized_model_id = Path(model_id).stem
+    size_hint = model_size_token or args.model_size or normalized_model_id.split("-")[-1]
+    model_size = info_size_to_int(size_hint)
+    target_task = args.task or normalized_model_id.split("-")[0]
     agent, cfg = load_pretrained_tdmpc2(
-        checkpoint_path=ckpt_path,
+        ckpt_path=ckpt_path,
+        task=target_task,
+        model_size=model_size,
+        device=str(device),
+        obs=args.obs_type,
+        collection_mode="single",
+    )
+    return agent, cfg
+
+
+def info_size_to_int(size_token: str) -> int:
+    cleaned = "".join([c for c in str(size_token) if c.isdigit()])
+    if not cleaned:
+        raise ValueError(f"Unable to parse model size from token: {size_token}")
+    return int(cleaned)
+
+
+def _load_agent_for_model_multitask(
+    model_id: str, ckpt_path: str, args: argparse.Namespace, device: torch.device
+):
+    task_set, model_size = parse_multitask_model_id(Path(model_id).stem)
+    agent, cfg = load_pretrained_tdmpc2(
+        ckpt_path=ckpt_path,
+        task=args.task or task_set,
+        model_size=model_size,
         device=str(device),
         model_id=normalized_model_id,
         # task=args.task,  <-- REMOVED to preserve checkpoint task (e.g. mt30)
         obs_type=args.obs_type,
     )
+    cfg.task_set = task_set
+    cfg.model_size = model_size
+    cfg.model_id = model_id
     return agent, cfg
 
 
@@ -328,19 +472,34 @@ def main(args: argparse.Namespace) -> None:
             f"[collect_corrector_data] COLLECT model_id={model_id} (name={model_name}, size={model_size}), saving to {out_path}"
         )
 
-        agent, cfg = _load_agent_for_model(model_id, ckpt_path, args, device)
-
-        collect_for_agent(
-            agent,
-            cfg,
-            args,
-            str(out_path),
-            model_meta={
-                "model_id": model_id,
-                "model_name": model_name,
-                "model_size": model_size,
-            },
-        )
+        if args.collection_mode == "multi":
+            task_set, _ = parse_multitask_model_id(Path(model_id).stem)
+            agent, cfg = _load_agent_for_model_multitask(model_id, ckpt_path, args, device)
+            collect_for_agent_multitask(
+                agent,
+                cfg,
+                model_id=model_id,
+                out_path=out_path,
+                episodes=args.episodes,
+                plan_horizon=args.plan_horizon,
+                history_len=args.history_len,
+                device=device,
+            )
+        else:
+            agent, cfg = _load_agent_for_model(
+                model_id, ckpt_path, args, device, model_size_token=model_size
+            )
+            collect_for_agent(
+                agent,
+                cfg,
+                args,
+                str(out_path),
+                model_meta={
+                    "model_id": model_id,
+                    "model_name": model_name,
+                    "model_size": model_size,
+                },
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -348,9 +507,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", "--env", dest="task", type=str, help="Task name / env id", required=False)
     parser.add_argument("--checkpoint", type=str, required=False, default=None, help="Manual TD-MPC2 checkpoint path")
     parser.add_argument(
-        "--checkpoint_dir", type=str, default="tdmpc2_pretrained", help="Directory containing pretrained checkpoints"
+        "--checkpoint_dir",
+        "--model_dir",
+        dest="checkpoint_dir",
+        type=str,
+        default="tdmpc2_pretrained",
+        help="Directory containing pretrained checkpoints",
     )
-    parser.add_argument("--model_dir", dest="checkpoint_dir", type=str, default=None, help="Alias for --checkpoint_dir")
     parser.add_argument("--model_id", type=str, default=None, help="Model id (checkpoint stem) to load")
     parser.add_argument("--model_size", type=str, default=None, help="Filter checkpoints by size token (e.g., 5m)")
     parser.add_argument("--all_models", action="store_true", help="Iterate over all checkpoints in checkpoint_dir")
@@ -384,6 +547,15 @@ def parse_args() -> argparse.Namespace:
         default="state",
         choices=["state", "rgb"],
         help="Observation type for dmcontrol envs.",
+    )
+    parser.add_argument(
+        "--collection_mode",
+        type=str,
+        default="multi",
+        choices=["single", "multi"],
+        help=(
+            "single: use a specific env task (legacy). multi: use multi-task setup (mt30/mt70/mt80) directly."
+        ),
     )
     return parser.parse_args()
 

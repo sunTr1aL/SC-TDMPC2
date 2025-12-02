@@ -142,6 +142,91 @@ python scripts/eval_mt30_humanoid.py \
 
 -----
 
+## Multi-Task Corrector Pipeline (mt30 / mt70 / mt80)
+
+This repo supports using the official multi-task TD-MPC2 checkpoints (mt30, mt70, mt80) as teachers and training a corrector on **multi-task rollouts**.
+
+### 1. Download pretrained multi-task checkpoints
+
+Download the official multi-task TD-MPC2 checkpoints from <https://www.tdmpc2.com/models> and place them in:
+
+- `tdmpc2_pretrained/`
+
+We assume filenames of the form:
+
+- `mt30-5M.pt`, `mt30-19M.pt`, `mt30-48M.pt`, `mt30-317M.pt`
+- `mt70-5M.pt`, `mt70-19M.pt`, ...
+- `mt80-5M.pt`, `mt80-19M.pt`, `mt80-48M.pt`, `mt80-317M.pt`
+
+Here:
+
+- `mt30`, `mt70`, `mt80` = multi-task datasets (30 / 70 / 80 tasks).
+- `5M`, `19M`, `48M`, `317M` = parameter counts (millions).
+
+### 2. Collect multi-task corrector data
+
+To collect corrector training data directly from all available multi-task models:
+
+```bash
+python scripts/collect_corrector_data.py   --collection_mode multi   --all_model_sizes   --checkpoint_dir tdmpc2_pretrained   --episodes 20   --plan_horizon 3   --history_len 4   --output_dir data   --device cuda
+```
+
+Behavior:
+
+- The script parses model IDs (e.g., `mt70-19M`) into:
+  - `task_set = "mt70"`
+  - `model_size = 19`
+- It loads each model with `cfg.task = task_set` (multi-task setting).
+- It creates a **multi-task environment** via `make_env(cfg)` and runs TD-MPC2 in multi-task mode.
+- It collects training samples for the corrector (teacher action vs speculative plan) across all tasks.
+- For each `model_id`, the data is saved to:
+
+  ```text
+  data/corrector_data_{model_id}.pt
+  # e.g. data/corrector_data_mt70-19M.pt
+  ```
+
+- If a file already exists and looks valid, that model is **skipped** (use `--force_recollect` to override).
+
+### 3. Train corrector on multi-task data
+
+To train both corrector architectures (Two-Tower MLP and Temporal Transformer) on all collected multi-task data:
+
+```bash
+python scripts/train_corrector.py   --collection_mode multi   --checkpoint_dir tdmpc2_pretrained   --data_dir data   --all_models   --corrector_type both   --device cuda
+```
+
+This will:
+
+- Load each `data/corrector_data_{model_id}.pt`.
+- Train two corrector models for each checkpoint:
+  - `correctors/corrector_{model_id}_two_tower.pth`
+  - `correctors/corrector_{model_id}_temporal.pth`
+
+### 4. Evaluate multi-task speculative execution with corrector
+
+To evaluate baseline TD-MPC2 vs speculative execution with/without corrector, on all multi-task checkpoints:
+
+```bash
+python scripts/eval_corrector.py   --collection_mode multi   --checkpoint_dir tdmpc2_pretrained   --corrector_dir correctors   --all_models   --episodes 20   --max_steps 1000   --device cuda   --output_csv results/eval_multitask_corrector.csv   --output_plot results/eval_multitask_corrector.png
+```
+
+This script will:
+
+- Evaluate the following modes for each `model_id`:
+  - `baseline`: standard TD-MPC2 (no speculative execution).
+  - `2_step_naive`: execute the first 2 planned actions without replanning.
+  - `3_step_naive`: execute the first 3 planned actions without replanning.
+  - `2_step_corrector`: 2-step execution with corrector (Two-Tower / Temporal).
+  - `3_step_corrector`: 3-step execution with corrector.
+- Save metrics (returns, episode length, etc.) to the CSV file.
+- Generate plots comparing:
+  - performance across model sizes for each task-set (`mt30`, `mt70`, `mt80`),
+  - naive vs corrected speculative execution.
+
+> **Note:** Multi-task environments (especially `mt70` / `mt80`) rely on both DMControl and Meta-World.  
+> Make sure the necessary dependencies are installed and configured (Xvfb or headless rendering for DMControl, MuJoCo license setup, Meta-World dependencies, etc.).
+
 ## Distributed Multi-GPU Training (DDP)
 Use the provided DDP tooling to scale TD-MPC2 training across multiple GPUs:
 
